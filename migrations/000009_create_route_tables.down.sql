@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS route_points CASCADE;
+DROP TABLE IF EXISTS optimized_routes CASCADE; 

@@ -1,0 +1,1 @@
+ALTER TABLE rides DROP COLUMN booked_seats; 
