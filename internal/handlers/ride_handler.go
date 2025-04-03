@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"taxi-backend/internal/models"
 	"time"
@@ -109,6 +112,37 @@ func RideGetCompleted(db *gorm.DB) gin.HandlerFunc {
 // Создание новой поездки
 func RideCreate(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Сначала выведем информацию о входящем запросе
+		body, err := c.GetRawData()
+		if err != nil {
+			fmt.Printf("DEBUG: Ошибка при чтении тела запроса: %v\n", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Ошибка при чтении запроса"})
+			return
+		}
+
+		// Выведем сырые данные
+		fmt.Printf("DEBUG: Полученное сырое тело запроса: %s\n", string(body))
+
+		// Парсим JSON для детального вывода
+		var jsonData map[string]interface{}
+		err = json.Unmarshal(body, &jsonData)
+		if err != nil {
+			fmt.Printf("DEBUG: Ошибка при разборе JSON: %v\n", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат JSON"})
+			return
+		}
+
+		// Проверим тип поля departureDate
+		if departureDate, ok := jsonData["departureDate"]; ok {
+			fmt.Printf("DEBUG: Тип поля departureDate: %T, значение: %v\n",
+				departureDate, departureDate)
+		} else {
+			fmt.Printf("DEBUG: Поле departureDate отсутствует в запросе\n")
+		}
+
+		// Теперь создаем новый Reader из сохраненного тела для c.ShouldBindJSON
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+
 		var req struct {
 			FromAddress    string          `json:"fromAddress" binding:"required"`
 			ToAddress      string          `json:"toAddress" binding:"required"`
@@ -123,11 +157,17 @@ func RideCreate(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		if err := c.ShouldBindJSON(&req); err != nil {
+			fmt.Printf("DEBUG: Ошибка при разборе JSON в структуру: %v\n", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат данных"})
 			return
 		}
 
 		userID, _ := c.Get("user_id")
+
+		// Вывод отладочной информации о получаемой дате
+		fmt.Printf("DEBUG: Получена дата отправления: %v, в UTC: %v\n",
+			req.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"),
+			req.DepartureDate.UTC().Format("2006-01-02 15:04:05 -0700 MST"))
 
 		var (
 			frontSeatPrice *float64
@@ -153,7 +193,7 @@ func RideCreate(db *gorm.DB) gin.HandlerFunc {
 			Status:         models.RideStatusActive,
 			Price:          req.Price,
 			SeatsCount:     req.SeatsCount,
-			DepartureDate:  req.DepartureDate,
+			DepartureDate:  req.DepartureDate, // Используем дату точно как она пришла, без преобразования
 			Comment:        req.Comment,
 			FrontSeatPrice: frontSeatPrice,
 			BackSeatPrice:  backSeatPrice,
@@ -161,8 +201,12 @@ func RideCreate(db *gorm.DB) gin.HandlerFunc {
 			UpdatedAt:      time.Now().UTC(),
 		}
 
+		// Дополнительный вывод отладочной информации перед сохранением
+		fmt.Printf("DEBUG: Сохраняем поездку с датой отправления: %v\n",
+			ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
+
 		// Создаем запись в базе данных
-		err := db.Transaction(func(tx *gorm.DB) error {
+		err = db.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Create(ride).Error; err != nil {
 				return fmt.Errorf("ошибка создания поездки: %v", err)
 			}
@@ -170,15 +214,21 @@ func RideCreate(db *gorm.DB) gin.HandlerFunc {
 		})
 
 		if err != nil {
+			fmt.Printf("DEBUG: Ошибка при создании поездки: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при создании поездки"})
 			return
 		}
 
 		// Получаем созданную поездку с данными водителя
 		if err := db.Preload("Driver").First(ride, ride.ID).Error; err != nil {
+			fmt.Printf("DEBUG: Ошибка при получении данных поездки: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении данных поездки"})
 			return
 		}
+
+		// Дополнительный вывод отладочной информации после сохранения
+		fmt.Printf("DEBUG: После сохранения, дата отправления: %v\n",
+			ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
 
 		c.JSON(http.StatusOK, models.RideResponse{
 			ID:             ride.ID,
@@ -288,6 +338,21 @@ func RideCancel(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Отправляем WebSocket уведомление водителю
+		SendRideStatusUpdate(ride.DriverID, ride.ID, string(ride.Status))
+
+		// Если есть пассажир, отправляем уведомление и ему
+		if ride.PassengerID != nil {
+			SendRideStatusUpdate(*ride.PassengerID, ride.ID, string(ride.Status))
+		}
+
+		// Отправляем уведомления всем, у кого есть активные бронирования
+		var bookings []models.Booking
+		db.Where("ride_id = ?", rideID).Find(&bookings)
+		for _, booking := range bookings {
+			SendBookingStatusUpdate(booking.PassengerID, booking.ID, "cancelled")
+		}
+
 		c.JSON(http.StatusOK, gin.H{"message": "Поездка успешно отменена"})
 	}
 }
@@ -317,6 +382,21 @@ func RideComplete(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Отправляем WebSocket уведомление водителю
+		SendRideStatusUpdate(ride.DriverID, ride.ID, string(ride.Status))
+
+		// Если есть пассажир, отправляем уведомление и ему
+		if ride.PassengerID != nil {
+			SendRideStatusUpdate(*ride.PassengerID, ride.ID, string(ride.Status))
+		}
+
+		// Отправляем уведомления всем, у кого есть бронирования для этой поездки
+		var bookings []models.Booking
+		db.Where("ride_id = ?", rideID).Find(&bookings)
+		for _, booking := range bookings {
+			SendBookingStatusUpdate(booking.PassengerID, booking.ID, "completed")
+		}
+
 		c.JSON(http.StatusOK, gin.H{"message": "Поездка успешно завершена"})
 	}
 }
@@ -338,9 +418,15 @@ func RideUpdate(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		if err := c.ShouldBindJSON(&req); err != nil {
+			fmt.Printf("DEBUG: Ошибка при разборе JSON в RideUpdate: %v\n", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат данных"})
 			return
 		}
+
+		// Вывод отладочной информации о получаемой дате
+		fmt.Printf("DEBUG: RideUpdate - Получена дата отправления: %v, в UTC: %v\n",
+			req.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"),
+			req.DepartureDate.UTC().Format("2006-01-02 15:04:05 -0700 MST"))
 
 		rideID := c.Param("id")
 		userID, _ := c.Get("user_id")
@@ -386,6 +472,10 @@ func RideUpdate(db *gorm.DB) gin.HandlerFunc {
 			backSeatPrice = &bp
 		}
 
+		// Отладочная информация о текущей дате поездки перед обновлением
+		fmt.Printf("DEBUG: RideUpdate - Текущая дата отправления: %v\n",
+			ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
+
 		// Обновляем поля поездки
 		ride.FromAddress = req.FromAddress
 		ride.ToAddress = req.ToAddress
@@ -393,7 +483,7 @@ func RideUpdate(db *gorm.DB) gin.HandlerFunc {
 		ride.ToLocation = fmt.Sprintf("(%f,%f)", req.ToLocation.Latitude, req.ToLocation.Longitude)
 		ride.Price = req.Price
 		ride.SeatsCount = req.SeatsCount
-		ride.DepartureDate = req.DepartureDate
+		ride.DepartureDate = req.DepartureDate // Используем дату точно как она пришла, без преобразования
 		ride.Comment = req.Comment
 		ride.FrontSeatPrice = frontSeatPrice
 		ride.BackSeatPrice = backSeatPrice
@@ -402,9 +492,11 @@ func RideUpdate(db *gorm.DB) gin.HandlerFunc {
 		fmt.Printf("DEBUG: Updating ride with ID: %d\n", ride.ID)
 		fmt.Printf("DEBUG: FrontSeatPrice: %v\n", ride.FrontSeatPrice)
 		fmt.Printf("DEBUG: BackSeatPrice: %v\n", ride.BackSeatPrice)
+		fmt.Printf("DEBUG: DepartureDate: %v\n", ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
 
 		// Сохраняем изменения
 		if err := db.Save(&ride).Error; err != nil {
+			fmt.Printf("DEBUG: RideUpdate - Ошибка при сохранении: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении поездки"})
 			return
 		}
@@ -419,6 +511,7 @@ func RideUpdate(db *gorm.DB) gin.HandlerFunc {
 		fmt.Printf("DEBUG: Retrieved updated ride with ID: %d\n", ride.ID)
 		fmt.Printf("DEBUG: FrontSeatPrice after retrieval: %v\n", ride.FrontSeatPrice)
 		fmt.Printf("DEBUG: BackSeatPrice after retrieval: %v\n", ride.BackSeatPrice)
+		fmt.Printf("DEBUG: DepartureDate after retrieval: %v\n", ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
 
 		c.JSON(http.StatusOK, models.RideResponse{
 			ID:             ride.ID,
@@ -454,22 +547,24 @@ func RideSearch(db *gorm.DB) gin.HandlerFunc {
 		}
 
 		if err := c.ShouldBindJSON(&req); err != nil {
+			fmt.Printf("DEBUG: RideSearch - Ошибка при разборе JSON: %v\n", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат данных"})
 			return
+		}
+
+		// Для отладки выводим дату в том виде, в котором она пришла от клиента
+		if !req.DepartureDate.IsZero() {
+			fmt.Printf("DEBUG: RideSearch - Получена дата отправления: %v\n",
+				req.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
+		} else {
+			fmt.Printf("DEBUG: RideSearch - Дата отправления не указана\n")
 		}
 
 		fmt.Printf("DEBUG: Searching rides from %s to %s on %s for %d seats\n",
 			req.FromCity, req.ToCity, req.DepartureDate.Format("2006-01-02"), req.SeatsCount)
 
-		// Начинаем транзакцию
-		tx := db.Begin()
-		if tx.Error != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при начале транзакции"})
-			return
-		}
-
-		// Базовый запрос для поиска активных поездок
-		query := tx.Where("status IN (?)", []string{string(models.RideStatusActive), string(models.RideStatusStarted)})
+		// Используем обычный запрос без транзакции для поиска
+		query := db.Where("status IN (?)", []string{string(models.RideStatusActive), string(models.RideStatusStarted)})
 
 		// Поиск по городам отправления и назначения - используем более гибкий поиск
 		// Ищем поездки, где адрес содержит название города, а не начинается с него
@@ -478,6 +573,7 @@ func RideSearch(db *gorm.DB) gin.HandlerFunc {
 
 		// Если указана дата отправления, ищем поездки на эту дату или позже
 		if !req.DepartureDate.IsZero() {
+			// Устанавливаем начало дня в том же часовом поясе, что и полученная дата
 			startOfDay := time.Date(
 				req.DepartureDate.Year(),
 				req.DepartureDate.Month(),
@@ -485,8 +581,18 @@ func RideSearch(db *gorm.DB) gin.HandlerFunc {
 				0, 0, 0, 0,
 				req.DepartureDate.Location(),
 			)
+
+			// Выводим для отладки время начала дня
+			fmt.Printf("DEBUG: RideSearch - Начало дня для поиска: %v\n",
+				startOfDay.Format("2006-01-02 15:04:05 -0700 MST"))
+
 			// Ищем поездки на указанную дату или позже (в течение недели)
 			endOfWeek := startOfDay.Add(7 * 24 * time.Hour)
+
+			// Выводим для отладки конец периода поиска
+			fmt.Printf("DEBUG: RideSearch - Конец периода поиска: %v\n",
+				endOfWeek.Format("2006-01-02 15:04:05 -0700 MST"))
+
 			query = query.Where("departure_date BETWEEN ? AND ?", startOfDay, endOfWeek)
 		}
 
@@ -496,16 +602,20 @@ func RideSearch(db *gorm.DB) gin.HandlerFunc {
 		// Получаем результаты
 		var rides []models.Ride
 		if err := query.Order("departure_date ASC").Find(&rides).Error; err != nil {
-			tx.Rollback()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при поиске поездок"})
 			return
 		}
 
 		fmt.Printf("DEBUG: Found %d rides\n", len(rides))
 
+		// Для отладки выводим информацию о найденных поездках
+		for i, ride := range rides {
+			fmt.Printf("DEBUG: RideSearch - Найдена поездка #%d, ID: %d, Дата: %v\n",
+				i+1, ride.ID, ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
+		}
+
 		// Если поездок не найдено, попробуем более широкий поиск
 		if len(rides) == 0 {
-			tx.Rollback()
 			// Сбрасываем запрос и ищем только по городам, без учета даты и количества мест
 			query = db.Where("status IN (?)", []string{string(models.RideStatusActive), string(models.RideStatusStarted)})
 			query = query.Where("from_address LIKE ? AND to_address LIKE ?",
@@ -518,56 +628,47 @@ func RideSearch(db *gorm.DB) gin.HandlerFunc {
 			}
 
 			fmt.Printf("DEBUG: Found %d rides after broader search\n", len(rides))
+
+			// Для отладки выводим информацию о найденных поездках при широком поиске
+			for i, ride := range rides {
+				fmt.Printf("DEBUG: RideSearch (широкий поиск) - Найдена поездка #%d, ID: %d, Дата: %v\n",
+					i+1, ride.ID, ride.DepartureDate.Format("2006-01-02 15:04:05 -0700 MST"))
+			}
 		}
 
-		// Обновляем количество забронированных мест для каждой поездки
+		// Получаем и обрабатываем информацию о забронированных местах поодиночке,
+		// без обновления базы данных внутри этого запроса
 		for i := range rides {
 			var totalBookedSeats int
-			if err := tx.Model(&models.Booking{}).
+			if err := db.Model(&models.Booking{}).
 				Where("ride_id = ? AND status = ?", rides[i].ID, "approved").
 				Select("COALESCE(SUM(seats_count), 0)").
 				Scan(&totalBookedSeats).Error; err != nil {
-				tx.Rollback()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при подсчете забронированных мест"})
-				return
+				// Логируем ошибку, но продолжаем выполнение
+				fmt.Printf("ERROR: Failed to count booked seats for ride %d: %v\n", rides[i].ID, err)
+				// Установим значение по умолчанию
+				totalBookedSeats = 0
 			}
 
-			// Обновляем количество забронированных мест в базе данных
-			if err := tx.Model(&rides[i]).Update("booked_seats", totalBookedSeats).Error; err != nil {
-				tx.Rollback()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении количества забронированных мест"})
-				return
-			}
-
-			// Перезагружаем поездку для получения актуальных данных
-			if err := tx.First(&rides[i], rides[i].ID).Error; err != nil {
-				tx.Rollback()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении обновленных данных поездки"})
-				return
-			}
-		}
-
-		// Подтверждаем транзакцию
-		if err := tx.Commit().Error; err != nil {
-			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при сохранении изменений"})
-			return
+			// Просто обновляем поле в памяти, без записи в базу данных
+			rides[i].BookedSeats = totalBookedSeats
 		}
 
 		// Если указано количество мест, фильтруем поездки с достаточным количеством свободных мест
+		var filteredRides []models.Ride
 		if req.SeatsCount > 0 {
-			var filteredRides []models.Ride
 			for _, ride := range rides {
 				if ride.SeatsCount-ride.BookedSeats >= req.SeatsCount {
 					filteredRides = append(filteredRides, ride)
 				}
 			}
-			rides = filteredRides
+		} else {
+			filteredRides = rides
 		}
 
 		// Формируем ответ с расширенной информацией
 		var response []map[string]interface{}
-		for _, ride := range rides {
+		for _, ride := range filteredRides {
 			// Базовая информация о поездке
 			rideData := map[string]interface{}{
 				"id":               ride.ID,
@@ -582,6 +683,7 @@ func RideSearch(db *gorm.DB) gin.HandlerFunc {
 				"comment":          ride.Comment,
 				"front_seat_price": ride.FrontSeatPrice,
 				"back_seat_price":  ride.BackSeatPrice,
+				"status":           string(ride.Status),
 			}
 
 			// Информация о водителе
@@ -752,9 +854,49 @@ func RideStart(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Отправляем WebSocket уведомление водителю
+		SendRideStatusUpdate(ride.DriverID, ride.ID, string(models.RideStatusStarted))
+
+		// Если есть пассажир, отправляем уведомление и ему
+		if ride.PassengerID != nil {
+			SendRideStatusUpdate(*ride.PassengerID, ride.ID, string(models.RideStatusStarted))
+		}
+
+		// Отправляем уведомления всем, у кого есть бронирования для этой поездки
+		var bookings []models.Booking
+		db.Where("ride_id = ?", rideID).Find(&bookings)
+		for _, booking := range bookings {
+			SendBookingStatusUpdate(booking.PassengerID, booking.ID, "started")
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Поездка успешно начата",
 			"status":  string(models.RideStatusStarted),
 		})
 	}
+}
+
+// UpdateRideBookedSeats обновляет количество забронированных мест для поездки
+func UpdateRideBookedSeats(db *gorm.DB, rideID uint) (int, error) {
+	var totalBookedSeats int
+
+	// Получаем сумму забронированных мест только для подтвержденных бронирований
+	if err := db.Model(&models.Booking{}).
+		Where("ride_id = ? AND status = ?", rideID, models.BookingStatusApproved).
+		Select("COALESCE(SUM(seats_count), 0)").
+		Scan(&totalBookedSeats).Error; err != nil {
+		return 0, err
+	}
+
+	// Обновляем поездку с новым количеством мест
+	if err := db.Model(&models.Ride{}).
+		Where("id = ?", rideID).
+		Updates(map[string]interface{}{
+			"booked_seats": totalBookedSeats,
+			"updated_at":   time.Now(),
+		}).Error; err != nil {
+		return 0, err
+	}
+
+	return totalBookedSeats, nil
 }

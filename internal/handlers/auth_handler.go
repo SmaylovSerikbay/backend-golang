@@ -1,31 +1,30 @@
 package handlers
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"taxi-backend/internal/models"
+	"taxi-backend/internal/services"
 	"taxi-backend/internal/utils"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
 type RegisterRequest struct {
-	Email     string `json:"email" binding:"required,email"`
-	Password  string `json:"password" binding:"required,min=6"`
 	FirstName string `json:"firstName" binding:"required"`
 	LastName  string `json:"lastName" binding:"required"`
 	Phone     string `json:"phone" binding:"required,e164"`
 }
 
-type LoginRequest struct {
-	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required"`
+type VerifyCodeRequest struct {
+	Phone string `json:"phone" binding:"required,e164"`
+	Code  string `json:"code" binding:"required"`
+}
+
+type SendCodeRequest struct {
+	Phone string `json:"phone" binding:"required,e164"`
 }
 
 type AuthResponse struct {
@@ -33,24 +32,14 @@ type AuthResponse struct {
 	Message string              `json:"message,omitempty"`
 	Token   string              `json:"token,omitempty"`
 	User    models.UserResponse `json:"user,omitempty"`
+	Error   string              `json:"error,omitempty"`
 }
 
 func AuthRegister(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Логируем тело запроса
-		body, _ := io.ReadAll(c.Request.Body)
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
-		log.Printf("Тело запроса: %s", string(body))
-
-		// Логируем заголовки
-		log.Printf("Заголовки запроса: %v", c.Request.Header)
-
 		var req RegisterRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			log.Printf("Ошибка валидации данных: %v", err)
-			log.Printf("Полученные данные: %+v", req)
-			log.Printf("Тип ошибки: %T", err)
-
 			c.JSON(http.StatusBadRequest, AuthResponse{
 				Success: false,
 				Message: fmt.Sprintf("Неверный формат данных: %v", err),
@@ -58,20 +47,8 @@ func AuthRegister(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Логируем успешно распарсенные данные
-		log.Printf("Успешно распарсенные данные: %+v", req)
-
-		// Проверяем, существует ли пользователь с таким email
-		var existingUser models.User
-		if result := db.Where("email = ?", req.Email).First(&existingUser); result.Error == nil {
-			c.JSON(http.StatusBadRequest, AuthResponse{
-				Success: false,
-				Message: "Пользователь с таким email уже существует",
-			})
-			return
-		}
-
 		// Проверяем, существует ли пользователь с таким телефоном
+		var existingUser models.User
 		if result := db.Where("phone = ?", req.Phone).First(&existingUser); result.Error == nil {
 			c.JSON(http.StatusBadRequest, AuthResponse{
 				Success: false,
@@ -80,20 +57,8 @@ func AuthRegister(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Хешируем пароль
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, AuthResponse{
-				Success: false,
-				Message: "Ошибка при создании пользователя",
-			})
-			return
-		}
-
 		// Создаем нового пользователя
 		user := models.User{
-			Email:     req.Email,
-			Password:  string(hashedPassword),
 			FirstName: req.FirstName,
 			LastName:  req.LastName,
 			Phone:     req.Phone,
@@ -123,7 +88,6 @@ func AuthRegister(db *gorm.DB) gin.HandlerFunc {
 			Token:   token,
 			User: models.UserResponse{
 				ID:        user.ID,
-				Email:     user.Email,
 				FirstName: user.FirstName,
 				LastName:  user.LastName,
 				Phone:     user.Phone,
@@ -134,37 +98,100 @@ func AuthRegister(db *gorm.DB) gin.HandlerFunc {
 	}
 }
 
-func AuthLogin(db *gorm.DB) gin.HandlerFunc {
+func SendVerificationCode(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var req LoginRequest
+		var req SendCodeRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			log.Printf("Ошибка привязки JSON: %v", err)
+			c.JSON(http.StatusBadRequest, AuthResponse{
+				Success: false,
+				Message: "Неверный формат данных",
+				Error:   err.Error(),
+			})
+			return
+		}
+
+		// Проверяем формат номера телефона
+		if req.Phone == "" {
+			log.Printf("Пустой номер телефона")
+			c.JSON(http.StatusBadRequest, AuthResponse{
+				Success: false,
+				Message: "Номер телефона не может быть пустым",
+			})
+			return
+		}
+
+		log.Printf("Получен запрос на отправку кода для номера: %s", req.Phone)
+
+		whatsappService := services.NewWhatsAppService()
+		code := whatsappService.GenerateVerificationCode()
+		log.Printf("Сгенерирован код подтверждения: %s для номера: %s", code, req.Phone)
+
+		// Отправляем код через WhatsApp
+		err := whatsappService.SendVerificationCode(req.Phone, code)
+		if err != nil {
+			log.Printf("Ошибка при отправке кода через WhatsApp: %v", err)
+			c.JSON(http.StatusInternalServerError, AuthResponse{
+				Success: false,
+				Message: "Ошибка при отправке кода подтверждения",
+				Error:   err.Error(),
+			})
+			return
+		}
+
+		log.Printf("Код успешно отправлен на номер: %s", req.Phone)
+
+		c.JSON(http.StatusOK, AuthResponse{
+			Success: true,
+			Message: "Код подтверждения отправлен",
+		})
+	}
+}
+
+func VerifyCode(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req VerifyCodeRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, AuthResponse{
 				Success: false,
 				Message: "Неверный формат данных",
+				Error:   err.Error(),
 			})
 			return
 		}
 
-		// Ищем пользователя
+		// Проверяем код через WhatsApp сервис
+		whatsappService := services.NewWhatsAppService()
+		isValid, err := whatsappService.VerifyCode(req.Phone, req.Code)
+		if err != nil {
+			log.Printf("Ошибка при проверке кода: %v", err)
+			c.JSON(http.StatusBadRequest, AuthResponse{
+				Success: false,
+				Message: "Ошибка при проверке кода",
+				Error:   err.Error(),
+			})
+			return
+		}
+
+		if !isValid {
+			c.JSON(http.StatusBadRequest, AuthResponse{
+				Success: false,
+				Message: "Неверный код подтверждения",
+			})
+			return
+		}
+
+		// Ищем пользователя по телефону
 		var user models.User
-		if result := db.Where("email = ?", req.Email).First(&user); result.Error != nil {
+		if result := db.Where("phone = ?", req.Phone).First(&user); result.Error != nil {
 			c.JSON(http.StatusUnauthorized, AuthResponse{
 				Success: false,
-				Message: "Неверный email или пароль",
+				Message: "Пользователь не найден",
 			})
 			return
 		}
 
-		// Проверяем пароль
-		if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
-			c.JSON(http.StatusUnauthorized, AuthResponse{
-				Success: false,
-				Message: "Неверный email или пароль",
-			})
-			return
-		}
-
-		// Получаем актуальные данные пользователя с предзагрузкой всех связанных данных
+		// Получаем актуальные данные пользователя
 		if err := db.Preload("DriverDocuments").First(&user, user.ID).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, AuthResponse{
 				Success: false,
@@ -173,28 +200,9 @@ func AuthLogin(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		log.Printf("Данные пользователя при входе: %+v", user)
-		log.Printf("PhotoUrl пользователя при входе: '%s'", user.PhotoUrl)
-
-		// Если PhotoUrl пустой, пробуем получить его из базы данных
-		if user.PhotoUrl == "" {
-			var photoUrl string
-			err := db.Raw("SELECT photo_url FROM users WHERE id = ? AND photo_url IS NOT NULL AND photo_url != ''", user.ID).Scan(&photoUrl).Error
-			if err == nil && photoUrl != "" {
-				user.PhotoUrl = photoUrl
-				// Обновляем photo_url в базе данных
-				if err := db.Exec("UPDATE users SET photo_url = ? WHERE id = ?", photoUrl, user.ID).Error; err != nil {
-					log.Printf("Ошибка при обновлении photo_url: %v", err)
-				} else {
-					log.Printf("Успешно обновлен photo_url: %s", photoUrl)
-				}
-			}
-		}
-
 		// Формируем ответ с данными пользователя
 		userResponse := models.UserResponse{
 			ID:        user.ID,
-			Email:     user.Email,
 			FirstName: user.FirstName,
 			LastName:  user.LastName,
 			Phone:     user.Phone,
@@ -222,8 +230,6 @@ func AuthLogin(db *gorm.DB) gin.HandlerFunc {
 			}
 		}
 
-		log.Printf("Отправляем ответ при входе: %+v", userResponse)
-
 		// Генерируем JWT токен
 		token, err := utils.GenerateJWT(user.ID)
 		if err != nil {
@@ -246,51 +252,18 @@ func AuthLogin(db *gorm.DB) gin.HandlerFunc {
 func GetCurrentUser(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetUint("user_id")
-		role, _ := c.Get("role")
 
-		// Если это админ, возвращаем специальный ответ
-		if role == "admin" {
-			c.JSON(http.StatusOK, models.UserResponse{
-				ID:        0,
-				Email:     "admin@admin.com",
-				FirstName: "Admin",
-				LastName:  "",
-				Phone:     "",
-				Role:      "admin",
-				CreatedAt: time.Now(),
+		var user models.User
+		if err := db.Preload("DriverDocuments").First(&user, userID).Error; err != nil {
+			c.JSON(http.StatusNotFound, AuthResponse{
+				Success: false,
+				Message: "Пользователь не найден",
 			})
 			return
 		}
 
-		var user models.User
-
-		// Получаем пользователя со всеми связанными данными
-		if err := db.Preload("DriverDocuments").First(&user, userID).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user"})
-			return
-		}
-
-		log.Printf("GetCurrentUser: Данные пользователя: %+v", user)
-		log.Printf("GetCurrentUser: PhotoUrl пользователя: '%s'", user.PhotoUrl)
-
-		// Если PhotoUrl пустой, пробуем получить его из базы данных
-		if user.PhotoUrl == "" {
-			var photoUrl string
-			err := db.Raw("SELECT photo_url FROM users WHERE id = ? AND photo_url IS NOT NULL AND photo_url != ''", userID).Scan(&photoUrl).Error
-			if err == nil && photoUrl != "" {
-				user.PhotoUrl = photoUrl
-				// Обновляем photo_url в базе данных
-				if err := db.Exec("UPDATE users SET photo_url = ? WHERE id = ?", photoUrl, userID).Error; err != nil {
-					log.Printf("GetCurrentUser: Ошибка при обновлении photo_url: %v", err)
-				} else {
-					log.Printf("GetCurrentUser: Успешно обновлен photo_url: %s", photoUrl)
-				}
-			}
-		}
-
-		response := models.UserResponse{
+		userResponse := models.UserResponse{
 			ID:        user.ID,
-			Email:     user.Email,
 			FirstName: user.FirstName,
 			LastName:  user.LastName,
 			Phone:     user.Phone,
@@ -299,9 +272,8 @@ func GetCurrentUser(db *gorm.DB) gin.HandlerFunc {
 			PhotoUrl:  user.PhotoUrl,
 		}
 
-		// Добавляем документы водителя, если они есть
 		if user.DriverDocuments != nil {
-			response.DriverDocuments = &models.DriverDocumentsResponse{
+			userResponse.DriverDocuments = &models.DriverDocumentsResponse{
 				ID:                   user.DriverDocuments.ID,
 				CarBrand:             user.DriverDocuments.CarBrand,
 				CarModel:             user.DriverDocuments.CarModel,
@@ -318,8 +290,10 @@ func GetCurrentUser(db *gorm.DB) gin.HandlerFunc {
 			}
 		}
 
-		log.Printf("GetCurrentUser: Отправляем ответ: %+v", response)
-		c.JSON(http.StatusOK, response)
+		c.JSON(http.StatusOK, AuthResponse{
+			Success: true,
+			User:    userResponse,
+		})
 	}
 }
 

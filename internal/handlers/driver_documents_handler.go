@@ -10,6 +10,9 @@ import (
 	"bytes"
 	"io"
 
+	"encoding/json"
+	"os"
+
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -124,7 +127,7 @@ func DriverDocumentsGet(db *gorm.DB) gin.HandlerFunc {
 		userID, _ := c.Get("user_id")
 		role, _ := c.Get("role")
 
-		log.Printf("Получение документов для пользователя ID: %v", userID)
+		log.Printf("UPDATED CODE: Получение документов для пользователя ID: %v", userID)
 
 		// Если админ, возвращаем все документы
 		if role == "admin" {
@@ -148,7 +151,6 @@ func DriverDocumentsGet(db *gorm.DB) gin.HandlerFunc {
 					UserID: doc.UserID,
 					User: &models.UserResponse{
 						ID:        user.ID,
-						Email:     user.Email,
 						FirstName: user.FirstName,
 						LastName:  user.LastName,
 						Phone:     user.Phone,
@@ -184,7 +186,26 @@ func DriverDocumentsGet(db *gorm.DB) gin.HandlerFunc {
 		if result.Error != nil {
 			log.Printf("Ошибка при получении документов: %v", result.Error)
 			if result.Error == gorm.ErrRecordNotFound {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Документы не найдены"})
+				// Возвращаем пустой объект с пометкой, что документы не найдены
+				log.Printf("ИСПРАВЛЕНО: Возвращаем объект с пометкой 'not_found' для пользователя ID: %v", userID)
+				response := gin.H{
+					"id":                     0,
+					"user_id":                userID,
+					"car_brand":              "",
+					"car_model":              "",
+					"car_year":               "",
+					"car_color":              "",
+					"car_number":             "",
+					"driver_license_front":   "",
+					"driver_license_back":    "",
+					"car_registration_front": "",
+					"car_registration_back":  "",
+					"status":                 "not_found",
+					"message":                "Документы для этого пользователя не найдены",
+					"created_at":             time.Time{},
+					"updated_at":             time.Time{},
+				}
+				c.JSON(http.StatusOK, response)
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении документов"})
@@ -203,7 +224,6 @@ func DriverDocumentsGet(db *gorm.DB) gin.HandlerFunc {
 			UserID: docs.UserID,
 			User: &models.UserResponse{
 				ID:        user.ID,
-				Email:     user.Email,
 				FirstName: user.FirstName,
 				LastName:  user.LastName,
 				Phone:     user.Phone,
@@ -249,7 +269,7 @@ func DriverDocumentsUpdateStatus(db *gorm.DB) gin.HandlerFunc {
 
 		var req struct {
 			Status          models.DriverDocumentStatus `json:"status" binding:"required"`
-			RejectionReason string                      `json:"rejectionReason"`
+			RejectionReason string                      `json:"rejectionReason,omitempty"`
 		}
 
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -259,7 +279,7 @@ func DriverDocumentsUpdateStatus(db *gorm.DB) gin.HandlerFunc {
 			// Попробуем другой формат данных (с snake_case)
 			var altReq struct {
 				Status          models.DriverDocumentStatus `json:"status" binding:"required"`
-				RejectionReason string                      `json:"rejection_reason"`
+				RejectionReason string                      `json:"rejection_reason,omitempty"`
 			}
 
 			if err := c.Request.Body.Close(); err != nil {
@@ -280,7 +300,7 @@ func DriverDocumentsUpdateStatus(db *gorm.DB) gin.HandlerFunc {
 			req.RejectionReason = altReq.RejectionReason
 		}
 
-		log.Printf("Получен запрос на обновление статуса документа: %+v", req)
+		log.Printf("Получен запрос на обновление статуса документа: статус=%s, причина=%s", req.Status, req.RejectionReason)
 
 		docID := c.Param("id")
 		log.Printf("ID документа из параметров: %s", docID)
@@ -290,6 +310,16 @@ func DriverDocumentsUpdateStatus(db *gorm.DB) gin.HandlerFunc {
 		if err := db.First(&docs, docID).Error; err != nil {
 			log.Printf("Документы не найдены: %v", err)
 			c.JSON(http.StatusNotFound, gin.H{"error": "Документы не найдены"})
+			return
+		}
+
+		log.Printf("Текущий статус документа: %s", docs.Status)
+
+		// Получаем пользователя для отправки уведомления
+		var user models.User
+		if err := db.First(&user, docs.UserID).Error; err != nil {
+			log.Printf("Ошибка при получении пользователя: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении пользователя"})
 			return
 		}
 
@@ -306,9 +336,79 @@ func DriverDocumentsUpdateStatus(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
+		log.Printf("Документ успешно обновлен, новый статус: %s", docs.Status)
+
+		// Получаем обновленный документ из БД для проверки
+		var updatedDocs models.DriverDocuments
+		if err := db.First(&updatedDocs, docID).Error; err != nil {
+			log.Printf("Ошибка при получении обновленного документа: %v", err)
+		} else {
+			log.Printf("Проверка обновления: ID=%d, статус=%s", updatedDocs.ID, updatedDocs.Status)
+		}
+
+		// Отправляем WebSocket уведомление пользователю
+		log.Printf("Подготовка к отправке WebSocket уведомления пользователю ID %d о статусе документа %d", user.ID, docs.ID)
+		log.Printf("Статус документа для WebSocket: %s, тип: %T", string(docs.Status), docs.Status)
+		SendDocumentStatusUpdate(user.ID, docs.ID, string(docs.Status))
+		log.Printf("Отправлено WebSocket уведомление пользователю ID %d о статусе документа %d", user.ID, docs.ID)
+
+		// Отправляем уведомление пользователю
+		if user.FCMToken != "" {
+			var title, body string
+			switch docs.Status {
+			case models.DocumentStatusApproved:
+				title = "Документы одобрены"
+				body = "Ваши документы были проверены и одобрены. Теперь вы можете создавать поездки."
+			case models.DocumentStatusRejected:
+				title = "Документы отклонены"
+				body = "Ваши документы были отклонены. Причина: " + docs.RejectionReason
+			case models.DocumentStatusRevision:
+				title = "Требуется доработка документов"
+				body = "Ваши документы требуют доработки. Причина: " + docs.RejectionReason
+			}
+
+			if title != "" && body != "" {
+				notification := map[string]interface{}{
+					"notification": map[string]interface{}{
+						"title": title,
+						"body":  body,
+					},
+					"data": map[string]interface{}{
+						"document_id": docID,
+						"status":      string(docs.Status),
+					},
+					"to": user.FCMToken,
+				}
+
+				// Отправляем уведомление через FCM
+				fcmURL := "https://fcm.googleapis.com/fcm/send"
+				fcmKey := os.Getenv("FCM_SERVER_KEY")
+				if fcmKey == "" {
+					log.Printf("FCM_SERVER_KEY не установлен")
+				} else {
+					client := &http.Client{}
+					jsonData, _ := json.Marshal(notification)
+					req, _ := http.NewRequest("POST", fcmURL, bytes.NewBuffer(jsonData))
+					req.Header.Set("Authorization", "key="+fcmKey)
+					req.Header.Set("Content-Type", "application/json")
+
+					resp, err := client.Do(req)
+					if err != nil {
+						log.Printf("Ошибка при отправке FCM уведомления: %v", err)
+					} else {
+						defer resp.Body.Close()
+						body, _ := io.ReadAll(resp.Body)
+						log.Printf("Ответ FCM: %s", string(body))
+					}
+				}
+			}
+		} else {
+			log.Printf("FCM токен не найден для пользователя ID %d", user.ID)
+		}
+
 		// Получаем информацию о пользователе для ответа
-		var user models.User
-		if err := db.First(&user, docs.UserID).Error; err != nil {
+		var userResponse models.User
+		if err := db.First(&userResponse, docs.UserID).Error; err != nil {
 			log.Printf("Ошибка при получении пользователя для документа ID %v: %v", docs.ID, err)
 		}
 
@@ -317,13 +417,12 @@ func DriverDocumentsUpdateStatus(db *gorm.DB) gin.HandlerFunc {
 			ID:     docs.ID,
 			UserID: docs.UserID,
 			User: &models.UserResponse{
-				ID:        user.ID,
-				Email:     user.Email,
-				FirstName: user.FirstName,
-				LastName:  user.LastName,
-				Phone:     user.Phone,
-				PhotoUrl:  user.PhotoUrl,
-				Role:      user.Role,
+				ID:        userResponse.ID,
+				FirstName: userResponse.FirstName,
+				LastName:  userResponse.LastName,
+				Phone:     userResponse.Phone,
+				PhotoUrl:  userResponse.PhotoUrl,
+				Role:      userResponse.Role,
 			},
 			CarBrand:             docs.CarBrand,
 			CarModel:             docs.CarModel,

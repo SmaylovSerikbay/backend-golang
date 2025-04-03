@@ -18,7 +18,6 @@ func UserGetProfile(db *gorm.DB) gin.HandlerFunc {
 		if role == "admin" {
 			c.JSON(http.StatusOK, models.UserResponse{
 				ID:        0,
-				Email:     "admin@admin.com",
 				FirstName: "Admin",
 				LastName:  "",
 				Phone:     "",
@@ -39,7 +38,6 @@ func UserGetProfile(db *gorm.DB) gin.HandlerFunc {
 		// Формируем ответ
 		response := models.UserResponse{
 			ID:        user.ID,
-			Email:     user.Email,
 			FirstName: user.FirstName,
 			LastName:  user.LastName,
 			Phone:     user.Phone,
@@ -128,7 +126,6 @@ func UserUpdateProfile(db *gorm.DB) gin.HandlerFunc {
 		// Формируем ответ
 		response := models.UserResponse{
 			ID:        user.ID,
-			Email:     user.Email,
 			FirstName: user.FirstName,
 			LastName:  user.LastName,
 			Phone:     user.Phone,

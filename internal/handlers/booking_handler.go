@@ -441,15 +441,14 @@ func BookingApprove(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Обновляем количество забронированных мест
-		if err := tx.Model(&ride).Updates(map[string]interface{}{
-			"booked_seats": totalBookedSeats + booking.SeatsCount,
-			"updated_at":   time.Now(),
-		}).Error; err != nil {
+		// Обновляем количество забронированных мест используя централизованную функцию
+		totalBookedSeats, err := UpdateRideBookedSeats(tx, ride.ID)
+		if err != nil {
 			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении поездки"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении количества мест"})
 			return
 		}
+		ride.BookedSeats = totalBookedSeats
 
 		// Удаляем существующий маршрут для пересчета
 		if err := tx.Where("ride_id = ?", ride.ID).Delete(&models.RoutePoint{}).Error; err != nil {
@@ -508,6 +507,17 @@ func BookingApprove(db *gorm.DB) gin.HandlerFunc {
 				notificationData,
 			)
 		}
+
+		// Отправляем WebSocket уведомление о изменении статуса бронирования
+		// немедленно всем заинтересованным сторонам
+		notificationData := map[string]interface{}{
+			"booking_id":   booking.ID,
+			"status":       string(booking.Status),
+			"passenger_id": booking.PassengerID,
+			"driver_id":    ride.DriverID,
+			"ride_id":      booking.RideID,
+		}
+		services.SendBookingStatusUpdate(notificationData)
 
 		c.JSON(http.StatusOK, response)
 	}
@@ -642,6 +652,17 @@ func BookingReject(db *gorm.DB) gin.HandlerFunc {
 			)
 		}
 
+		// Отправляем WebSocket уведомление о изменении статуса бронирования
+		notificationData := map[string]interface{}{
+			"booking_id":   booking.ID,
+			"status":       string(booking.Status),
+			"passenger_id": booking.PassengerID,
+			"driver_id":    ride.DriverID,
+			"ride_id":      booking.RideID,
+			"reason":       booking.RejectReason,
+		}
+		services.SendBookingStatusUpdate(notificationData)
+
 		c.JSON(http.StatusOK, response)
 	}
 }
@@ -691,29 +712,14 @@ func BookingCancel(db *gorm.DB) gin.HandlerFunc {
 
 		// Если бронирование было подтверждено, уменьшаем количество забронированных мест
 		if booking.Status == "approved" {
-			// Пересчитываем общее количество забронированных мест для поездки
-			var totalBookedSeats int
-			if err := tx.Model(&models.Booking{}).
-				Where("ride_id = ? AND status = ? AND id != ?",
-					booking.RideID,
-					"approved",
-					booking.ID).
-				Select("COALESCE(SUM(seats_count), 0)").
-				Scan(&totalBookedSeats).Error; err != nil {
-				tx.Rollback()
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при подсчете забронированных мест"})
-				return
-			}
-
-			// Обновляем количество забронированных мест в поездке
-			if err := tx.Model(&ride).Updates(map[string]interface{}{
-				"booked_seats": totalBookedSeats,
-				"updated_at":   time.Now(),
-			}).Error; err != nil {
+			// Обновляем количество забронированных мест используя централизованную функцию
+			totalBookedSeats, err := UpdateRideBookedSeats(tx, ride.ID)
+			if err != nil {
 				tx.Rollback()
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении количества мест"})
 				return
 			}
+			ride.BookedSeats = totalBookedSeats
 		}
 
 		// Обновляем статус бронирования
@@ -766,6 +772,16 @@ func BookingCancel(db *gorm.DB) gin.HandlerFunc {
 			PassengerName:   passenger.FirstName + " " + passenger.LastName,
 			PassengerPhone:  passenger.Phone,
 		}
+
+		// Отправляем WebSocket уведомление о изменении статуса бронирования
+		notificationData := map[string]interface{}{
+			"booking_id":   booking.ID,
+			"status":       string(booking.Status),
+			"passenger_id": booking.PassengerID,
+			"driver_id":    ride.DriverID,
+			"ride_id":      booking.RideID,
+		}
+		services.SendBookingStatusUpdate(notificationData)
 
 		c.JSON(http.StatusOK, response)
 	}

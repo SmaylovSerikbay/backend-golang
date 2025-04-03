@@ -1,14 +1,11 @@
 package models
 
 import (
-	"log"
 	"time"
 )
 
 type User struct {
 	ID              uint             `json:"id" gorm:"primaryKey;column:id;autoIncrement"`
-	Email           string           `json:"email" gorm:"column:email;unique;not null;type:varchar(255)"`
-	Password        string           `json:"-" gorm:"column:password;not null;type:varchar(255)"`
 	FirstName       string           `json:"firstName" gorm:"column:first_name;not null;type:varchar(255)"`
 	LastName        string           `json:"lastName" gorm:"column:last_name;not null;type:varchar(255)"`
 	Phone           string           `json:"phone" gorm:"column:phone;unique;not null;type:varchar(20)"`
@@ -22,7 +19,6 @@ type User struct {
 
 type UserResponse struct {
 	ID              uint                     `json:"id"`
-	Email           string                   `json:"email"`
 	FirstName       string                   `json:"firstName"`
 	LastName        string                   `json:"lastName"`
 	Phone           string                   `json:"phone"`
@@ -35,18 +31,12 @@ type UserResponse struct {
 
 // AfterFind вызывается после загрузки модели из базы данных
 func (u *User) AfterFind() error {
-	// Логируем значение photo_url для отладки
-	log.Printf("AfterFind: PhotoUrl до обработки: '%s'", u.PhotoUrl)
-
-	// Ничего не делаем, если photo_url пустой
 	if u.PhotoUrl == "" {
 		return nil
 	}
 
-	// Добавляем начальный слеш, если его нет
 	if u.PhotoUrl != "" && u.PhotoUrl[0] != '/' {
 		u.PhotoUrl = "/" + u.PhotoUrl
-		log.Printf("AfterFind: Добавлен начальный слеш к PhotoUrl: '%s'", u.PhotoUrl)
 	}
 
 	return nil
